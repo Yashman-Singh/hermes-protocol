@@ -1,4 +1,32 @@
+
+# Xcode
 .DS_Store
+*.swp
+*.lock
+*~.nib
+
+# Xcode User Data
+xcuserdata/
+*.xcuserstate
+project.xcworkspace/
+*.xccheckout
+*.moved-aside
+
+# Build Directories
+DerivedData/
+build/
 .build/
+
+# Swift Package Manager
 .swiftpm/
-*.logger
+Package.resolved
+
+# CocoaPods
+Pods/
+
+# Documentation
+TECHNICAL_SPEC.md
+implementation_plan.md
+task.md
+walkthrough.md
+temp.txt

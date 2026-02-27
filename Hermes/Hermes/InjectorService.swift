@@ -54,6 +54,16 @@ class InjectorService {
         }
     }
     
+    func canUseAccessibilityForCurrentApp() -> Bool {
+        guard let frontApp = NSWorkspace.shared.frontmostApplication else {
+            return false
+        }
+        let appName = frontApp.localizedName ?? "Unknown"
+        let clipboardOnlyApps = ["Antigravity", "Code", "Cursor", "Slack", "Discord", "Electron"]
+        
+        return !clipboardOnlyApps.contains(where: { appName.contains($0) })
+    }
+
     private func injectViaAccessibility(text: String) -> InjectionResult {
         // Get the frontmost application (more reliable than SystemWide focused element)
         guard let frontApp = NSWorkspace.shared.frontmostApplication else {
@@ -69,13 +79,8 @@ class InjectorService {
         
         let pid = frontApp.processIdentifier
         let appName = frontApp.localizedName ?? "Unknown"
-        // Only print target once per session if possible, but for debugging now it's fine.
-        // print("Attempting injection into: \(appName) (PID: \(pid))")
         
-        // List of apps that are known to have "silent failures" with AX injection or require Clipboard
-        let clipboardOnlyApps = ["Antigravity", "Code", "Cursor", "Slack", "Discord", "Electron"]
-        
-        if clipboardOnlyApps.contains(where: { appName.contains($0) }) {
+        if !canUseAccessibilityForCurrentApp() {
             print("'\(appName)' is in the clipboard-only list. Skipping Accessibility.")
             return .clipboardRequired
         }

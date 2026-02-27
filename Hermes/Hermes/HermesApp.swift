@@ -6,6 +6,7 @@ struct HermesApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     
     var body: some Scene {
+        // No visible windows — the app lives in the menu bar
         Settings {
             EmptyView()
         }
@@ -15,32 +16,41 @@ struct HermesApp: App {
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
     var cancellables = Set<AnyCancellable>()
+    var popover: NSPopover?
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 1. Setup Menu Bar Item
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem?.button {
             button.image = NSImage(systemSymbolName: "waveform.circle", accessibilityDescription: "Hermes")
-            button.action = #selector(menuBarClicked)
+            button.action = #selector(togglePopover)
         }
         
-        // 2. Setup Overlay Window
+        // 2. Setup Popover
+        let popover = NSPopover()
+        popover.contentSize = NSSize(width: 300, height: 400)
+        popover.behavior = .transient // Dismiss when clicking outside
+        popover.animates = true
+        popover.contentViewController = NSHostingController(rootView: SettingsPopoverView())
+        self.popover = popover
+        
+        // 3. Setup Overlay Window
         WindowManager.shared.setup()
         
-        // 3. Initialize HotKey Manager
+        // 4. Initialize HotKey Manager
         _ = HotKeyManager.shared
         
-        // 4. Bind Recording State to Window Visibility
-        AudioService.shared.$isRecordingState
+        // 5. Bind Recording and Refining State to Window Visibility
+        Publishers.CombineLatest(AudioService.shared.$isRecordingState, LLMService.shared.$isRefining)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] isRecording in
+            .sink { [weak self] isRecording, isRefining in
                 // Update Menu Bar Icon
                 if let button = self?.statusItem?.button {
-                    button.image = NSImage(systemSymbolName: isRecording ? "record.circle.fill" : "waveform.circle", accessibilityDescription: "Hermes")
+                    button.image = NSImage(systemSymbolName: isRecording ? "record.circle.fill" : (isRefining ? "brain" : "waveform.circle"), accessibilityDescription: "Hermes")
                 }
                 
                 // Show/Hide Overlay
-                if isRecording {
+                if isRecording || isRefining {
                     WindowManager.shared.show()
                 } else {
                     WindowManager.shared.hide()
@@ -51,16 +61,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &cancellables)
     }
     
-    @objc func menuBarClicked() {
-        // Option to quit or show settings could go here
-        let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Quit Hermes", action: #selector(terminate), keyEquivalent: "q"))
-        statusItem?.menu = menu
-        statusItem?.button?.performClick(nil)
-        statusItem?.menu = nil // specific hack for simple click vs menu
-    }
-    
-    @objc func terminate() {
-        NSApplication.shared.terminate(nil)
+    @objc func togglePopover() {
+        guard let button = statusItem?.button else { return }
+        
+        if let popover = popover, popover.isShown {
+            popover.performClose(nil)
+        } else {
+            popover?.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            // Make the popover window visible on all Spaces (including full-screen apps)
+            if let popoverWindow = popover?.contentViewController?.view.window {
+                popoverWindow.level = .popUpMenu
+                popoverWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            }
+        }
     }
 }

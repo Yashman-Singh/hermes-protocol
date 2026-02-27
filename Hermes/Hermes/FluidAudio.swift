@@ -54,11 +54,12 @@ class FluidAudio: ObservableObject {
     }
     
     func stop() {
-        // Trigger injection of the final transcript with a trailing space
-        let textToInject = self.transcript + " "
-        Task { @MainActor in
-            InjectorService.shared.inject(text: textToInject)
-        }
+        // Call refine synchronously — this is already on MainActor
+        // (called from HotKeyManager → AudioService.stopRecording).
+        // Synchronous call ensures isRefining = true is set BEFORE
+        // isRecordingState = false, keeping the overlay visible.
+        let textToRefine = self.transcript
+        LLMService.shared.refine(text: textToRefine)
     }
     
     func transcribe(samples: [Float]) {

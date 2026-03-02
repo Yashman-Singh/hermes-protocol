@@ -60,14 +60,9 @@ class WindowManager: ObservableObject {
     func show() {
         guard let window = window else { return }
         
-        // Position at Mouse Cursor
+        // Position at mouse cursor
         let mouseLocation = NSEvent.mouseLocation
-        // Offset so the 100x100 window is centered relative to the cursor but slightly above/right
-        // Center of window is (50, 50). We want that center to be at (mouse.x + 20, mouse.y - 20)
-        // Origin = Center - (Width/2, Height/2)
-        // Origin.x = (mouse.x + 20) - 50 = mouse.x - 30
-        // Origin.y = (mouse.y - 20) - 50 = mouse.y - 70
-        let newOrigin = CGPoint(x: mouseLocation.x - 30, y: mouseLocation.y - 70)
+        let newOrigin = CGPoint(x: mouseLocation.x + 15, y: mouseLocation.y - 60)
         window.setFrameOrigin(newOrigin)
         
         window.orderFront(nil)

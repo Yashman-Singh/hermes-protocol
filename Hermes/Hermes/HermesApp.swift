@@ -1,5 +1,6 @@
 import SwiftUI
 import Combine
+import UserNotifications
 
 @main
 struct HermesApp: App {
@@ -19,10 +20,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var popover: NSPopover?
     
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // 1. Setup Menu Bar Item
+        // 0. Kill any zombie Hermes processes from previous runs
+        if let myBundle = Bundle.main.bundleIdentifier {
+            for app in NSRunningApplication.runningApplications(withBundleIdentifier: myBundle)
+            where app != NSRunningApplication.current {
+                app.terminate()
+                print("[Hermes] Terminated zombie process: pid=\(app.processIdentifier)")
+            }
+        }
+        
+        // 1. Setup Menu Bar Item (starts with loading icon)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem?.button {
-            button.image = NSImage(systemSymbolName: "waveform.circle", accessibilityDescription: "Hermes")
+            button.image = NSImage(systemSymbolName: "ellipsis.circle", accessibilityDescription: "Hermes (Loading...)")
             button.action = #selector(togglePopover)
         }
         
@@ -40,10 +50,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // 4. Initialize HotKey Manager
         _ = HotKeyManager.shared
         
-        // 5. Bind Recording and Refining State to Window Visibility
+        // 5. Request Microphone Permission (triggers dialog on first launch)
+        AudioService.shared.requestPermission()
+        
+        // 6. Prompt for Accessibility permission up front (required for text injection).
+        InjectorService.shared.requestAccessibilityPermissionIfNeeded()
+        
+        // 7. Watch for FluidAudio model readiness
+        FluidAudio.shared.$isModelReady
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] isReady in
+                guard isReady else { return }
+                // Switch menu bar icon from loading to ready
+                if let button = self?.statusItem?.button {
+                    button.image = NSImage(systemSymbolName: "waveform.circle", accessibilityDescription: "Hermes")
+                }
+                // Show a macOS notification
+                self?.showReadyNotification()
+            }
+            .store(in: &cancellables)
+        
+        // 8. Bind Recording and Refining State to Window Visibility
         Publishers.CombineLatest(AudioService.shared.$isRecordingState, LLMService.shared.$isRefining)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] isRecording, isRefining in
+                guard FluidAudio.shared.isModelReady else { return }
                 // Update Menu Bar Icon
                 if let button = self?.statusItem?.button {
                     button.image = NSImage(systemSymbolName: isRecording ? "record.circle.fill" : (isRefining ? "brain" : "waveform.circle"), accessibilityDescription: "Hermes")
@@ -54,7 +85,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     WindowManager.shared.show()
                 } else {
                     WindowManager.shared.hide()
-                    // Re-hide app to ensure focus returns to previous app
                     NSApplication.shared.hide(nil)
                 }
             }
@@ -68,11 +98,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             popover.performClose(nil)
         } else {
             popover?.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            // Make the popover window visible on all Spaces (including full-screen apps)
             if let popoverWindow = popover?.contentViewController?.view.window {
                 popoverWindow.level = .popUpMenu
                 popoverWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
             }
+        }
+    }
+    
+    private func showReadyNotification() {
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            guard granted else { return }
+            let content = UNMutableNotificationContent()
+            content.title = "Hermes is ready"
+            content.body = "Press ⌥S to start dictating."
+            content.sound = .default
+            
+            let request = UNNotificationRequest(identifier: "hermes-ready", content: content, trigger: nil)
+            center.add(request)
         }
     }
 }

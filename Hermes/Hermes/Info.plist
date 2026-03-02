@@ -6,6 +6,8 @@
     <string>Hermes needs access to your microphone to capture voice commands.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>Hermes converts your speech to text securely on-device.</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.productivity</string>
     <key>LSUIElement</key>
     <true/>
 </dict>

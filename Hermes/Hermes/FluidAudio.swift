@@ -1,7 +1,7 @@
 import Foundation
 import AVFoundation
 import Combine
-import FluidAudio
+@preconcurrency import FluidAudio
 
 class FluidAudio: ObservableObject {
     static let shared = FluidAudio()
@@ -11,6 +11,9 @@ class FluidAudio: ObservableObject {
     @Published var isModelReady: Bool = false
     
     private var asrManager: AsrManager?
+    private var isTranscribing = false
+    private var pendingSamples: [Float]?
+    private var isStopped = true  // Prevents late transcription results after stop
     
     init() {
         Task {
@@ -22,7 +25,6 @@ class FluidAudio: ObservableObject {
     private func setup() async {
         do {
             self.status = "Downloading models..."
-            // Download and load the v3 Parakeet model (approx 100-300MB)
             let models = try await AsrModels.downloadAndLoad(version: .v3)
             
             self.status = "Initializing engine..."
@@ -39,44 +41,79 @@ class FluidAudio: ObservableObject {
         }
     }
     
-    func requestPermission() {
-        // FluidAudio (local) doesn't strictly need SFSpeechRecognizer permission, 
-        // but it's good practice if we fall back or use mic. 
-        // Since AudioService handles Mic permission, we are good.
-        // We can leave this empty or remove it.
+    /// Reset critical flags synchronously so audio callbacks are accepted immediately.
+    /// Called from AudioService.startRecording() BEFORE the audio engine starts.
+    func prepareForNewSession() {
+        isStopped = false
+        isTranscribing = false
+        pendingSamples = nil
     }
     
     func start() async throws {
-        // Reset state if needed
+        // Reset transcript on MainActor (cosmetic — UI update)
         await MainActor.run {
             self.transcript = ""
         }
+        print("[Hermes.ASR] start() — session reset")
     }
     
     func stop() {
+        // Mark as stopped FIRST — this prevents any in-flight or pending
+        // transcriptions from updating the transcript after we capture it.
+        isStopped = true
+        pendingSamples = nil
+        
+        let textToRefine = self.transcript
+        print("[Hermes.ASR] stop() — captured transcript='\(textToRefine.prefix(50))' length=\(textToRefine.count)")
+        
         // Call refine synchronously — this is already on MainActor
         // (called from HotKeyManager → AudioService.stopRecording).
         // Synchronous call ensures isRefining = true is set BEFORE
         // isRecordingState = false, keeping the overlay visible.
-        let textToRefine = self.transcript
         LLMService.shared.refine(text: textToRefine)
     }
     
     func transcribe(samples: [Float]) {
-        guard isModelReady, let asrManager = asrManager else { return }
+        // Don't accept new transcription requests after stop
+        guard isModelReady, !isStopped, let asrManager = asrManager else { return }
+        
+        // If a transcription is already in-flight, queue this one
+        // (only the latest request is kept — older ones are dropped)
+        if isTranscribing {
+            pendingSamples = samples
+            return
+        }
+        
+        performTranscription(samples: samples, manager: asrManager)
+    }
+    
+    private func performTranscription(samples: [Float], manager: AsrManager) {
+        isTranscribing = true
         
         Task {
             do {
-                // Perform transcription on the accumulated samples
-                let result = try await asrManager.transcribe(samples, source: .system)
+                let result = try await manager.transcribe(samples, source: .system)
                 
-                await MainActor.run {
-                    if !result.text.isEmpty {
-                        self.transcript = result.text
+                // Only update transcript if we haven't been stopped
+                if !self.isStopped {
+                    await MainActor.run {
+                        if !result.text.isEmpty {
+                            self.transcript = result.text
+                            print("[Hermes.ASR] transcript updated='\(result.text.prefix(50))' length=\(result.text.count)")
+                        }
                     }
+                } else {
+                    print("[Hermes.ASR] Discarding late transcription result (session stopped)")
                 }
             } catch {
                 print("Transcription error: \(error)")
+            }
+            
+            // Check if new samples arrived while we were transcribing
+            self.isTranscribing = false
+            if !self.isStopped, let pending = self.pendingSamples {
+                self.pendingSamples = nil
+                self.performTranscription(samples: pending, manager: manager)
             }
         }
     }

@@ -7,8 +7,58 @@ class InjectorService {
     
     private init() {}
     
+    private enum InjectionMode {
+        case accessibility
+        case clipboard
+    }
+    
+    private struct FocusContext: Hashable {
+        let bundleIdentifier: String
+        let role: String
+        let subrole: String?
+        let isWebContext: Bool
+        
+        var cacheKey: String {
+            "\(bundleIdentifier)|\(role)|\(subrole ?? "-")|web:\(isWebContext)"
+        }
+    }
+    
+    private struct FocusTarget {
+        let frontApp: NSRunningApplication
+        let appName: String
+        let element: AXUIElement
+        let context: FocusContext
+    }
+    
+    private let policyLock = NSLock()
+    private var preferredInjectionByContext: [String: InjectionMode] = [:]
+    private var clipboardPreferredBundles: Set<String> = []
+    private let browserLikeRoles: Set<String> = ["AXWebArea", "AXBrowser"]
+    private let browserBundleTokens = ["browser", "chrome", "safari", "firefox", "brave", "edge", "opera", "vivaldi"]
+    private let immediateClipboardFocusErrorCodes: Set<Int32> = [-25212]
+    private let debugLoggingEnabled = true
+    
+    @discardableResult
+    func hasAccessibilityPermission(promptIfNeeded: Bool = false) -> Bool {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: promptIfNeeded] as CFDictionary
+        return AXIsProcessTrustedWithOptions(options)
+    }
+    
+    func requestAccessibilityPermissionIfNeeded() {
+        guard !hasAccessibilityPermission(promptIfNeeded: false) else { return }
+        _ = hasAccessibilityPermission(promptIfNeeded: true)
+        print("Accessibility permission required. Open System Settings → Privacy & Security → Accessibility and enable Hermes.")
+    }
+    
     func inject(text: String) {
         guard !text.isEmpty else { return }
+        debugLog("Inject requested. textLength=\(text.count)")
+        
+        guard hasAccessibilityPermission(promptIfNeeded: false) else {
+            requestAccessibilityPermissionIfNeeded()
+            copyToClipboardForManualPaste(text: text)
+            return
+        }
         
         // Hide the Hermes window to return focus to the previous active app
         NSApplication.shared.hide(nil)
@@ -23,92 +73,246 @@ class InjectorService {
     enum InjectionResult {
         case success
         case failure // Retryable (e.g. focus issue)
-        case clipboardRequired // Non-retryable (known blocklist)
+        case clipboardRequired // Non-retryable (context prefers clipboard)
     }
 
     private func attemptInjection(text: String, retries: Int) {
-        let result = self.injectViaAccessibility(text: text)
+        debugLog("Attempt injection. retriesRemaining=\(retries)")
+        
+        let frontApp = NSWorkspace.shared.frontmostApplication
+        let frontBundle = frontApp?.bundleIdentifier
+        if let frontBundle, isClipboardPreferredBundle(frontBundle) {
+            debugLog("Bundle cached for clipboard. bundle=\(frontBundle)")
+            injectViaClipboard(text: text)
+            print("Injected via Clipboard")
+            return
+        }
+        
+        let resolution = resolveFocusedTarget()
+        guard let target = resolution.target else {
+            if let bundle = frontBundle, let focusError = resolution.error,
+               shouldImmediatelyFallbackToClipboard(focusErrorCode: focusError.rawValue) {
+                rememberClipboardPreferredBundle(bundle)
+                debugLog("Focus error \(focusError.rawValue) triggers immediate clipboard mode. bundle=\(bundle)")
+                injectViaClipboard(text: text)
+                print("Injected via Clipboard")
+                return
+            }
+            
+            if retries > 0 {
+                print("Could not resolve focused element, retrying in 0.3s... (\(retries) retries left)")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                    self?.attemptInjection(text: text, retries: retries - 1)
+                }
+            } else {
+                if let bundle = frontBundle {
+                    rememberClipboardPreferredBundle(bundle)
+                }
+                print("Unable to resolve focused element. Falling back to Clipboard.")
+                injectViaClipboard(text: text)
+                print("Injected via Clipboard")
+            }
+            return
+        }
+        
+        // Prevent injecting into Hermes itself
+        if target.frontApp.bundleIdentifier == Bundle.main.bundleIdentifier {
+            if retries > 0 {
+                print("Hermes is still frontmost. Retrying... (\(retries) retries left)")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                    self?.attemptInjection(text: text, retries: retries - 1)
+                }
+            } else {
+                injectViaClipboard(text: text)
+                print("Injected via Clipboard")
+            }
+            return
+        }
+        
+        // Check for Electron App (needs manual accessibility enabled)
+        ensureElectronAccessibility(pid: target.frontApp.processIdentifier)
+        
+        let mode = preferredInjectionMode(for: target.context)
+        debugLog("Resolved context app=\(target.appName) bundle=\(target.context.bundleIdentifier) role=\(target.context.role) subrole=\(target.context.subrole ?? "-") mode=\(modeName(mode))")
+        let result: InjectionResult
+        
+        switch mode {
+        case .clipboard:
+            result = .clipboardRequired
+        case .accessibility:
+            result = injectViaAccessibility(element: target.element, appName: target.appName, text: text)
+        }
         
         switch result {
         case .success:
+            rememberPreferredMode(.accessibility, for: target.context)
             print("Injected via Accessibility")
+            debugLog("Result=success via accessibility")
             
         case .clipboardRequired:
-            print("App requires Clipboard. Skipping retries.")
+            rememberPreferredMode(.clipboard, for: target.context)
+            print("Context prefers Clipboard. Skipping retries.")
             self.injectViaClipboard(text: text)
             print("Injected via Clipboard")
+            debugLog("Result=clipboardRequired; used clipboard")
             
         case .failure:
             // If failed, check if we should retry
             if retries > 0 {
                 print("Accessibility failed/refused, retrying in 0.3s... (\(retries) retries left)")
+                debugLog("Result=failure via accessibility; scheduling retry")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                     self?.attemptInjection(text: text, retries: retries - 1)
                 }
             } else {
-                // 2. Fallback to Clipboard
+                // Last resort: fallback to clipboard and remember this context.
                 print("Accessibility exhausted. Falling back to Clipboard.")
+                rememberPreferredMode(.clipboard, for: target.context)
                 self.injectViaClipboard(text: text)
                 print("Injected via Clipboard")
+                debugLog("Result=failure exhausted; fell back to clipboard and cached context")
             }
         }
     }
     
     func canUseAccessibilityForCurrentApp() -> Bool {
-        guard let frontApp = NSWorkspace.shared.frontmostApplication else {
+        guard hasAccessibilityPermission(promptIfNeeded: false) else {
             return false
         }
-        let appName = frontApp.localizedName ?? "Unknown"
-        let clipboardOnlyApps = ["Antigravity", "Code", "Cursor", "Slack", "Discord", "Electron"]
         
-        return !clipboardOnlyApps.contains(where: { appName.contains($0) })
+        let resolution = resolveFocusedTarget()
+        guard let target = resolution.target else {
+            return false
+        }
+        
+        return preferredInjectionMode(for: target.context) == .accessibility
     }
 
-    private func injectViaAccessibility(text: String) -> InjectionResult {
-        // Get the frontmost application (more reliable than SystemWide focused element)
-        guard let frontApp = NSWorkspace.shared.frontmostApplication else {
-            print("Could not determine frontmost application.")
-            return .failure
-        }
-        
-        // Prevent injecting into Hermes itself
-        if frontApp.bundleIdentifier == Bundle.main.bundleIdentifier {
-            print("Hermes is still frontmost. Retrying...")
-            return .failure
-        }
-        
-        let pid = frontApp.processIdentifier
-        let appName = frontApp.localizedName ?? "Unknown"
-        
-        if !canUseAccessibilityForCurrentApp() {
-            print("'\(appName)' is in the clipboard-only list. Skipping Accessibility.")
-            return .clipboardRequired
-        }
-        
-        // Check for Electron App (needs manual accessibility enabled)
-        ensureElectronAccessibility(pid: pid)
-        
-        // Create Accessibility Application Element
-        let appElement = AXUIElementCreateApplication(pid)
-        
-        // Get the Focused Element within that App
-        var focusedElement: AnyObject?
-        let error = AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &focusedElement)
-        
-        guard error == .success, let element = focusedElement as! AXUIElement? else {
-            print("Could not get focused element in \(appName). Error: \(error.rawValue)")
-            return .failure
-        }
-        
-        // Try to insert text at cursor position (works for rich text editors like Notes)
-        let valueError = AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFTypeRef)
-        
-        if valueError == .success {
+    private func injectViaAccessibility(element: AXUIElement, appName: String, text: String) -> InjectionResult {
+        // Insert text at cursor via kAXSelectedTextAttribute (works in most native text editors)
+        if AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFTypeRef) == .success {
+            debugLog("AX selectedText succeeded for app=\(appName)")
             return .success
         }
         
-        print("Accessibility SetValue failed with error: \(valueError.rawValue)")
+        print("Accessibility text insertion failed for \(appName).")
+        debugLog("AX insertion failed for app=\(appName)")
         return .failure
+    }
+    
+    private func resolveFocusedTarget() -> (target: FocusTarget?, error: AXError?) {
+        guard let frontApp = NSWorkspace.shared.frontmostApplication else {
+            return (nil, nil)
+        }
+        
+        let appName = frontApp.localizedName ?? "Unknown"
+        let bundleIdentifier = frontApp.bundleIdentifier ?? "unknown.bundle"
+        let appElement = AXUIElementCreateApplication(frontApp.processIdentifier)
+        
+        var focusedElement: AnyObject?
+        let focusError = AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &focusedElement)
+        guard focusError == .success, let rawElement = focusedElement else {
+            print("Could not get focused element in \(appName). Error: \(focusError.rawValue)")
+            return (nil, focusError)
+        }
+        
+        let element = rawElement as! AXUIElement
+        let role = copyStringAttribute(from: element, attribute: kAXRoleAttribute as CFString) ?? "UnknownRole"
+        let subrole = copyStringAttribute(from: element, attribute: kAXSubroleAttribute as CFString)
+        let isWebContext = role == "AXWebArea" || hasAncestorRole("AXWebArea", for: element)
+        let context = FocusContext(
+            bundleIdentifier: bundleIdentifier,
+            role: role,
+            subrole: subrole,
+            isWebContext: isWebContext
+        )
+        
+        return (FocusTarget(frontApp: frontApp, appName: appName, element: element, context: context), nil)
+    }
+    
+    private func preferredInjectionMode(for context: FocusContext) -> InjectionMode {
+        policyLock.lock()
+        if let cached = preferredInjectionByContext[context.cacheKey] {
+            policyLock.unlock()
+            debugLog("Using cached mode=\(modeName(cached)) context=\(context.cacheKey)")
+            return cached
+        }
+        policyLock.unlock()
+        
+        if context.isWebContext {
+            debugLog("Defaulting to clipboard for web-context role chain. context=\(context.cacheKey)")
+            return .clipboard
+        }
+        
+        let lowerBundle = context.bundleIdentifier.lowercased()
+        if browserBundleTokens.contains(where: { lowerBundle.contains($0) }) {
+            debugLog("Defaulting to clipboard for browser-like bundle token. context=\(context.cacheKey)")
+            return .clipboard
+        }
+        
+        if browserLikeRoles.contains(context.role) {
+            debugLog("Defaulting to clipboard for browser-like role=\(context.role) context=\(context.cacheKey)")
+            return .clipboard
+        }
+        
+        debugLog("Defaulting to accessibility context=\(context.cacheKey)")
+        return .accessibility
+    }
+    
+    private func rememberPreferredMode(_ mode: InjectionMode, for context: FocusContext) {
+        policyLock.lock()
+        preferredInjectionByContext[context.cacheKey] = mode
+        policyLock.unlock()
+        debugLog("Cached mode=\(modeName(mode)) context=\(context.cacheKey)")
+    }
+    
+    private func isClipboardPreferredBundle(_ bundleIdentifier: String) -> Bool {
+        policyLock.lock()
+        let isPreferred = clipboardPreferredBundles.contains(bundleIdentifier)
+        policyLock.unlock()
+        return isPreferred
+    }
+    
+    private func rememberClipboardPreferredBundle(_ bundleIdentifier: String) {
+        policyLock.lock()
+        clipboardPreferredBundles.insert(bundleIdentifier)
+        policyLock.unlock()
+        debugLog("Cached clipboard-preferred bundle=\(bundleIdentifier)")
+    }
+    
+    private func shouldImmediatelyFallbackToClipboard(focusErrorCode: Int32) -> Bool {
+        immediateClipboardFocusErrorCodes.contains(focusErrorCode)
+    }
+    
+    private func copyStringAttribute(from element: AXUIElement, attribute: CFString) -> String? {
+        var rawValue: AnyObject?
+        let error = AXUIElementCopyAttributeValue(element, attribute, &rawValue)
+        guard error == .success, let value = rawValue as? String else {
+            return nil
+        }
+        return value
+    }
+    
+    private func hasAncestorRole(_ role: String, for element: AXUIElement, maxDepth: Int = 8) -> Bool {
+        var current: AXUIElement = element
+        var remainingDepth = maxDepth
+        
+        while remainingDepth > 0 {
+            if copyStringAttribute(from: current, attribute: kAXRoleAttribute as CFString) == role {
+                return true
+            }
+            
+            var parentValue: AnyObject?
+            let parentError = AXUIElementCopyAttributeValue(current, kAXParentAttribute as CFString, &parentValue)
+            guard parentError == .success, let rawParent = parentValue else {
+                return false
+            }
+            
+            current = rawParent as! AXUIElement
+            remainingDepth -= 1
+        }
+        
+        return false
     }
     
     private func ensureElectronAccessibility(pid: pid_t) {
@@ -118,24 +322,60 @@ class InjectorService {
     }
     
     private func injectViaClipboard(text: String) {
-        // Backup current clipboard
         let pasteboard = NSPasteboard.general
-        let _ = pasteboard.string(forType: .string) // Read to clear potential lazy writes? Or just ignore.
+        let previousItems = snapshotPasteboardItems(pasteboard)
         
-        // Set new text
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
         
         // Simulate Cmd+V
         simulatePaste()
         
-        // Restore clipboard (optional, delayed)
-        // DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-        //    if let old = oldString {
-        //        pasteboard.clearContents()
-        //        pasteboard.setString(old, forType: .string)
-        //    }
-        // }
+        // Restore the user's previous clipboard after a generous delay.
+        // 1.5s ensures even slow web apps (Google Docs) have finished
+        // reading the clipboard before we swap it back.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.restorePasteboardItems(previousItems, to: pasteboard)
+            self?.debugLog("Clipboard restored to previous contents")
+        }
+    }
+    
+    private func copyToClipboardForManualPaste(text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        print("Accessibility permission not granted. Copied text to clipboard for manual paste.")
+    }
+    
+
+
+    
+    private func snapshotPasteboardItems(_ pasteboard: NSPasteboard) -> [[NSPasteboard.PasteboardType: Data]] {
+        guard let items = pasteboard.pasteboardItems else { return [] }
+        
+        return items.map { item in
+            var storedData: [NSPasteboard.PasteboardType: Data] = [:]
+            for type in item.types {
+                if let data = item.data(forType: type) {
+                    storedData[type] = data
+                }
+            }
+            return storedData
+        }
+    }
+    
+    private func restorePasteboardItems(_ snapshot: [[NSPasteboard.PasteboardType: Data]], to pasteboard: NSPasteboard) {
+        guard !snapshot.isEmpty else { return }
+        
+        let restoredItems: [NSPasteboardItem] = snapshot.map { itemData in
+            let item = NSPasteboardItem()
+            for (type, data) in itemData {
+                item.setData(data, forType: type)
+            }
+            return item
+        }
+        
+        pasteboard.clearContents()
+        pasteboard.writeObjects(restoredItems)
     }
     
     private func simulatePaste() {
@@ -163,5 +403,20 @@ class InjectorService {
         vDown?.post(tap: .cghidEventTap)
         vUp?.post(tap: .cghidEventTap)
         cmdUp?.post(tap: .cghidEventTap)
+        debugLog("Simulated Cmd+V paste")
+    }
+    
+    private func debugLog(_ message: String) {
+        guard debugLoggingEnabled else { return }
+        print("[Hermes.Injector] \(message)")
+    }
+    
+    private func modeName(_ mode: InjectionMode) -> String {
+        switch mode {
+        case .accessibility:
+            return "accessibility"
+        case .clipboard:
+            return "clipboard"
+        }
     }
 }

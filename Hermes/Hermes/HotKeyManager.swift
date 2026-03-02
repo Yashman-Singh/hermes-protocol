@@ -20,6 +20,10 @@ class HotKeyManager: ObservableObject {
     
     func toggleRecording() {
         Task { @MainActor in
+            guard FluidAudio.shared.isModelReady else {
+                print("[Hermes] Hotkey pressed but model not ready yet. Ignoring.")
+                return
+            }
             if AudioService.shared.isRecordingState {
                 AudioService.shared.stopRecording()
                 self.isRecording = false

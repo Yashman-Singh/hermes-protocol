@@ -6,7 +6,6 @@ struct SettingsPopoverView: View {
     @AppStorage("refinementIntensity") var intensity: Int = 1
     @AppStorage("ollamaModel") var modelName: String = "llama3:8b"
     @State private var isHoveringQuit = false
-    @FocusState private var isModelFieldFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -19,7 +18,7 @@ struct SettingsPopoverView: View {
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundColor(.primary)
                 Spacer()
-                Text("v1.0")
+                Text("v1.1")
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .foregroundColor(.secondary.opacity(0.5))
             }
@@ -73,23 +72,12 @@ struct SettingsPopoverView: View {
                         .textCase(.uppercase)
                         .tracking(0.5)
 
-                    HStack(spacing: 8) {
-                        Image(systemName: "cpu")
-                            .font(.system(size: 12))
-                            .foregroundColor(.secondary)
-                        TextField("Model name", text: $modelName)
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 13, weight: .regular, design: .monospaced))
-                            .focused($isModelFieldFocused)
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(Color.primary.opacity(0.05))
-                    .cornerRadius(8)
+                    ModelPicker(modelName: $modelName)
 
-                    Text("Ensure Ollama is running with this model")
-                        .font(.system(size: 11))
+                    Text("Run: ollama pull \(modelName)")
+                        .font(.system(size: 11, design: .monospaced))
                         .foregroundColor(.secondary.opacity(0.6))
+                        .textSelection(.enabled)
                 }
             }
             .padding(.horizontal, 20)
@@ -128,10 +116,6 @@ struct SettingsPopoverView: View {
             .padding(.vertical, 12)
         }
         .frame(width: 300)
-        .onAppear {
-            // Prevent text field from auto-focusing
-            isModelFieldFocused = false
-        }
     }
 }
 
@@ -188,6 +172,83 @@ struct IntensityRow: View {
         .onHover { hovering in
             withAnimation(.easeInOut(duration: 0.12)) {
                 isHovering = hovering
+            }
+        }
+    }
+}
+
+// MARK: - Model Picker
+
+struct ModelPicker: View {
+    @Binding var modelName: String
+    @State private var isCustom = false
+    @FocusState private var isFieldFocused: Bool
+    
+    private struct ModelOption: Identifiable {
+        let id: String
+        let label: String
+        let detail: String
+    }
+    
+    private let models: [ModelOption] = [
+        ModelOption(id: "gemma3:1b",    label: "Gemma 3 1B",    detail: "~1 GB · Fastest"),
+        ModelOption(id: "llama3.2:1b",  label: "Llama 3.2 1B",  detail: "~1.3 GB · Fast"),
+        ModelOption(id: "llama3.2:3b",  label: "Llama 3.2 3B",  detail: "~2 GB · Recommended"),
+        ModelOption(id: "phi4-mini",    label: "Phi-4 Mini",     detail: "~2.5 GB · Great quality"),
+        ModelOption(id: "gemma3:4b",    label: "Gemma 3 4B",    detail: "~3 GB · High quality"),
+        ModelOption(id: "llama3:8b",    label: "Llama 3 8B",    detail: "~5 GB · Best quality"),
+    ]
+    
+    private var isKnownModel: Bool {
+        models.contains { $0.id == modelName }
+    }
+    
+    var body: some View {
+        VStack(spacing: 6) {
+            Picker(selection: Binding(
+                get: { isKnownModel ? modelName : "__custom__" },
+                set: { newValue in
+                    if newValue == "__custom__" {
+                        isCustom = true
+                    } else {
+                        isCustom = false
+                        modelName = newValue
+                    }
+                }
+            )) {
+                ForEach(models) { model in
+                    HStack {
+                        Text(model.label)
+                        Spacer()
+                        Text(model.detail)
+                            .foregroundColor(.secondary)
+                            .font(.system(size: 11))
+                    }
+                    .tag(model.id)
+                }
+                Divider()
+                Text("Custom…")
+                    .tag("__custom__")
+            } label: {
+                EmptyView()
+            }
+            .labelsHidden()
+            
+            if isCustom || !isKnownModel {
+                HStack(spacing: 8) {
+                    Image(systemName: "cpu")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                    TextField("e.g. mistral:7b", text: $modelName)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 13, weight: .regular, design: .monospaced))
+                        .focused($isFieldFocused)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color.primary.opacity(0.05))
+                .cornerRadius(8)
+                .onAppear { isFieldFocused = true }
             }
         }
     }

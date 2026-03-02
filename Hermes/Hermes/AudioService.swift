@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import Combine
+import SwiftUI
 
 class AudioService: ObservableObject {
     static let shared = AudioService()
@@ -8,7 +9,6 @@ class AudioService: ObservableObject {
     private let engine = AVAudioEngine()
     private var isRecording = false
     
-    // Explicitly define the target format: 16kHz, Float32, Mono
     private let targetFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32,
         sampleRate: 16000,
@@ -19,10 +19,43 @@ class AudioService: ObservableObject {
     @Published var isRecordingState = false
     @Published var hasMicrophonePermission = false
     
-    // Maximum buffer: 30 seconds at 16kHz = 480,000 samples
-    private let maxSampleCount = 480_000
+    /// True while chunks are being transcribed/processed. Keeps the orb visible.
+    @Published var isProcessingPipeline = false
     
-    /// Must be called on app launch to trigger the permission dialog.
+    // MARK: - Chunk Pipeline
+    
+    /// Seconds of audio per chunk (Raw/Editor streaming modes).
+    private let chunkDuration: TimeInterval = 8.0
+    
+    /// Audio samples for the current chunk being recorded.
+    private var accumulatedSamples: [Float] = []
+    
+    /// Timer that fires every `chunkDuration` to freeze and queue the current chunk.
+    private var chunkTimer: Timer?
+    
+    /// Queue of frozen audio chunks waiting to be processed.
+    private var chunkQueue: [[Float]] = []
+    
+    /// Whether the pipeline is currently processing a chunk.
+    private var isProcessingChunk = false
+    
+    /// Index of the next chunk (for ordered injection).
+    private var nextChunkIndex = 0
+    
+    /// Incomplete sentence tail from the previous chunk, carried forward.
+    private var carryForwardText: String = ""
+    
+    /// Whether recording has stopped (used to detect when pipeline should flush carry).
+    private var hasRecordingStopped = false
+    
+    private let fluidAudio = FluidAudio.shared
+    
+    // Writer mode: accumulate everything, process at the end.
+    // Max buffer: 5 minutes at 16kHz = 4,800,000 samples (~19 MB).
+    private let writerMaxSampleCount = 4_800_000
+    
+    // MARK: - Permissions
+    
     func requestPermission(completion: ((Bool) -> Void)? = nil) {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
@@ -56,10 +89,11 @@ class AudioService: ObservableObject {
         }
     }
     
+    // MARK: - Recording
+    
     func startRecording() throws {
         guard !isRecording else { return }
         
-        // Guard: ensure we have mic permission before touching the audio engine
         guard hasMicrophonePermission else {
             print("Cannot start recording: no microphone permission.")
             requestPermission { [weak self] granted in
@@ -71,16 +105,19 @@ class AudioService: ObservableObject {
         }
         
         accumulatedSamples.removeAll()
+        chunkQueue.removeAll()
+        isProcessingChunk = false
+        nextChunkIndex = 0
+        carryForwardText = ""
+        hasRecordingStopped = false
         
         let inputNode = engine.inputNode
         let inputFormat = inputNode.inputFormat(forBus: 0)
         
-        // Validate input format (some machines may return 0 sample rate if no mic)
         guard inputFormat.sampleRate > 0 else {
             throw NSError(domain: "AudioService", code: 2, userInfo: [NSLocalizedDescriptionKey: "No valid audio input format — is a microphone connected?"])
         }
         
-        // Ensure we accept the input format but convert to our target format
         guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
             throw NSError(domain: "AudioService", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not create audio converter"])
         }
@@ -88,7 +125,6 @@ class AudioService: ObservableObject {
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, time in
             guard let self = self else { return }
             
-            // Calculate format conversion ratio
             let inputFrameCount = buffer.frameLength
             let conversionRatio = 16000 / inputFormat.sampleRate
             let targetFrameCount = AVAudioFrameCount(Double(inputFrameCount) * conversionRatio)
@@ -116,32 +152,64 @@ class AudioService: ObservableObject {
         try engine.start()
         isRecording = true
         
-        // Reset FluidAudio state synchronously so it's ready before
-        // the first audio callback fires. The async Task is only for
-        // the MainActor transcript clear, which is cosmetic.
+        // Prepare services
+        LLMService.shared.prepareForSession()
+        InjectorService.shared.beginSession()
         fluidAudio.prepareForNewSession()
+        
         Task {
-            try? await fluidAudio.start()
+            await fluidAudio.startSession()
+        }
+        
+        // Start chunk timer for Raw/Editor modes (not Writer)
+        let level = RefinementLevel(rawValue: LLMService.shared.intensity) ?? .editor
+        if level != .writer {
+            startChunkTimer()
         }
         
         DispatchQueue.main.async {
             self.isRecordingState = true
         }
-        print("[Hermes.Audio] Recording started")
+        print("[Hermes.Audio] Recording started (mode: \(level))")
     }
     
     func stopRecording() {
         guard isRecording else { return }
         isRecording = false
-        print("[Hermes.Audio] stopRecording() — removing tap, stopping engine")
+        print("[Hermes.Audio] stopRecording()")
         
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         
-        // Clear samples synchronously BEFORE calling fluidAudio.stop()
-        accumulatedSamples.removeAll()
+        stopChunkTimer()
+        fluidAudio.stopSession()
         
-        fluidAudio.stop()
+        let level = RefinementLevel(rawValue: LLMService.shared.intensity) ?? .editor
+        
+        if level == .writer {
+            // Writer mode: send the full accumulated audio as one chunk
+            if !accumulatedSamples.isEmpty {
+                print("[Hermes.Audio] Writer mode — queuing full recording (\(accumulatedSamples.count) samples)")
+                chunkQueue.append(accumulatedSamples)
+                accumulatedSamples.removeAll()
+                processNextChunk(isFinal: true)
+            } else {
+                LLMService.shared.markRecordingStopped()
+            }
+        } else {
+            // Raw/Editor: flush remaining audio as the final chunk
+            if accumulatedSamples.count > 8000 { // At least 0.5s of audio
+                print("[Hermes.Audio] Flushing final chunk (\(accumulatedSamples.count) samples)")
+                chunkQueue.append(accumulatedSamples)
+                accumulatedSamples.removeAll()
+                processNextChunk(isFinal: true)
+            } else {
+                // No remaining audio — but there might be carry text
+                // or a chunk still processing
+                hasRecordingStopped = true
+                flushCarryIfDone()
+            }
+        }
         
         DispatchQueue.main.async {
             self.isRecordingState = false
@@ -149,29 +217,212 @@ class AudioService: ObservableObject {
         print("[Hermes.Audio] stopRecording() complete")
     }
     
-    private let fluidAudio = FluidAudio.shared
-    private var accumulatedSamples: [Float] = []
+    // MARK: - Chunk Timer
     
-    private func processAudio(buffer: AVAudioPCMBuffer) {
-        // 1. Extract samples from buffer
-        guard let floatChannelData = buffer.floatChannelData else { return }
-        let frameLength = Int(buffer.frameLength)
-        let ptr = floatChannelData[0] // Mono
-        let newSamples = Array(UnsafeBufferPointer(start: ptr, count: frameLength))
+    private func startChunkTimer() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.chunkTimer = Timer.scheduledTimer(withTimeInterval: self.chunkDuration, repeats: true) { [weak self] _ in
+                self?.freezeCurrentChunk()
+            }
+            print("[Hermes.Audio] Chunk timer started (\(self.chunkDuration)s intervals)")
+        }
+    }
+    
+    private func stopChunkTimer() {
+        DispatchQueue.main.async { [weak self] in
+            self?.chunkTimer?.invalidate()
+            self?.chunkTimer = nil
+        }
+    }
+    
+    /// Called by the chunk timer: freeze current audio, queue it, start fresh.
+    private func freezeCurrentChunk() {
+        guard isRecording else { return }
+        guard accumulatedSamples.count > 8000 else { return } // At least 0.5s
         
-        // 2. Accumulate (capped to prevent unbounded growth)
-        accumulatedSamples.append(contentsOf: newSamples)
-        if accumulatedSamples.count > maxSampleCount {
-            // Keep only the most recent samples (sliding window)
-            accumulatedSamples = Array(accumulatedSamples.suffix(maxSampleCount))
+        let chunk = accumulatedSamples
+        accumulatedSamples.removeAll()
+        
+        print("[Hermes.Audio] ❄️ Froze chunk #\(nextChunkIndex + chunkQueue.count) (\(chunk.count) samples, \(String(format: "%.1f", Double(chunk.count) / 16000))s)")
+        
+        chunkQueue.append(chunk)
+        processNextChunk(isFinal: false)
+    }
+    
+    // MARK: - Chunk Processing Pipeline
+    
+    /// Process the next chunk in the queue: Transcribe → LLM → Inject.
+    private func processNextChunk(isFinal: Bool) {
+        guard !isProcessingChunk else { return } // One at a time
+        guard !chunkQueue.isEmpty else {
+            if isFinal {
+                LLMService.shared.markRecordingStopped()
+            }
+            return
         }
         
-        // 3. Dispatch transcription once we have at least 1 second of audio
-        // FluidAudio handles deduplication — if a transcription is in-flight,
-        // it queues the latest samples and processes them when ready.
-        // Guard: don't dispatch if recording has stopped
-        if accumulatedSamples.count > 16000 && isRecording {
-            fluidAudio.transcribe(samples: accumulatedSamples)
+        isProcessingChunk = true
+        let samples = chunkQueue.removeFirst()
+        let chunkIndex = nextChunkIndex
+        nextChunkIndex += 1
+        
+        DispatchQueue.main.async {
+            self.isProcessingPipeline = true
+        }
+        
+        print("[Hermes.Audio] 🔄 Processing chunk #\(chunkIndex)")
+        
+        Task {
+            // 1. Transcribe the audio chunk
+            let rawTranscript = await fluidAudio.transcribeChunk(samples: samples)
+            
+            guard !rawTranscript.isEmpty else {
+                print("[Hermes.Audio] Chunk #\(chunkIndex) produced empty transcript — skipping")
+                await MainActor.run {
+                    self.isProcessingChunk = false
+                    self.processNextChunk(isFinal: isFinal && self.chunkQueue.isEmpty)
+                }
+                return
+            }
+            
+            // 2. Prepend any carried-over text from the previous chunk
+            let fullText = await MainActor.run { () -> String in
+                let combined = self.carryForwardText.isEmpty
+                    ? rawTranscript
+                    : self.carryForwardText + " " + rawTranscript
+                return combined
+            }
+            
+            let isLastChunk = isFinal && self.chunkQueue.isEmpty
+            
+            // 3. Split at last sentence boundary
+            //    Only inject complete sentences; carry the tail forward.
+            //    On the final chunk, inject everything.
+            let (toInject, toCarry) = self.splitAtSentenceBoundary(
+                text: fullText,
+                forceAll: isLastChunk
+            )
+            
+            await MainActor.run {
+                self.carryForwardText = toCarry
+            }
+            
+            if !toInject.isEmpty {
+                print("[Hermes.Audio] Chunk #\(chunkIndex) injecting: '\(toInject.prefix(60))' carry: '\(toCarry.prefix(40))'")
+                await MainActor.run {
+                    LLMService.shared.refineSegment(text: toInject, isFinal: isLastChunk && toCarry.isEmpty)
+                }
+            } else {
+                print("[Hermes.Audio] Chunk #\(chunkIndex) no complete sentence yet — carrying forward \(toCarry.count) chars")
+                if isLastChunk && !toCarry.isEmpty {
+                    // Final chunk but no sentence boundary — flush carry
+                    await MainActor.run {
+                        self.carryForwardText = ""
+                        LLMService.shared.refineSegment(text: toCarry, isFinal: true)
+                    }
+                } else if isLastChunk {
+                    await MainActor.run {
+                        LLMService.shared.markRecordingStopped()
+                    }
+                }
+            }
+            
+            // 4. Continue with next chunk
+            await MainActor.run {
+                self.isProcessingChunk = false
+                if !self.chunkQueue.isEmpty {
+                    self.processNextChunk(isFinal: isFinal)
+                } else {
+                    self.flushCarryIfDone()
+                }
+            }
+        }
+    }
+    
+    /// Flush any leftover carry text when the pipeline is idle and recording has stopped.
+    private func flushCarryIfDone() {
+        guard hasRecordingStopped else { return }
+        guard !isProcessingChunk && chunkQueue.isEmpty else { return }
+        
+        if !carryForwardText.isEmpty {
+            let carry = carryForwardText
+            carryForwardText = ""
+            print("[Hermes.Audio] Flushing carried text on stop: '\(carry.prefix(60))'")
+            LLMService.shared.refineSegment(text: carry, isFinal: true)
+        } else {
+            LLMService.shared.markRecordingStopped()
+        }
+        
+        isProcessingPipeline = false
+    }
+    
+    // MARK: - Sentence Boundary Detection
+    
+    /// Split text at the last sentence boundary.
+    /// Returns (complete sentences to inject, incomplete tail to carry forward).
+    /// If `forceAll` is true (final chunk), returns everything as toInject.
+    private func splitAtSentenceBoundary(text: String, forceAll: Bool) -> (toInject: String, toCarry: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        if forceAll || trimmed.isEmpty {
+            return (trimmed, "")
+        }
+        
+        // Safety valve: if carry has grown too long (>300 chars), flush everything
+        if trimmed.count > 300 {
+            print("[Hermes.Audio] Carry exceeded 300 chars — forcing injection")
+            return (trimmed, "")
+        }
+        
+        // Find the last sentence-ending punctuation followed by a space or end
+        let sentenceEnders: [Character] = [".", "?", "!"]
+        var lastBoundary: String.Index? = nil
+        
+        for i in trimmed.indices {
+            if sentenceEnders.contains(trimmed[i]) {
+                let nextIdx = trimmed.index(after: i)
+                // It's a sentence boundary if at the end OR followed by a space
+                if nextIdx == trimmed.endIndex || trimmed[nextIdx] == " " {
+                    lastBoundary = i
+                }
+            }
+        }
+        
+        guard let boundary = lastBoundary else {
+            // No sentence boundary found — carry everything
+            return ("", trimmed)
+        }
+        
+        let splitIdx = trimmed.index(after: boundary)
+        let toInject = String(trimmed[trimmed.startIndex..<splitIdx])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let toCarry = String(trimmed[splitIdx...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        return (toInject, toCarry)
+    }
+    
+    // MARK: - Audio Processing
+    
+    private func processAudio(buffer: AVAudioPCMBuffer) {
+        guard let floatChannelData = buffer.floatChannelData else { return }
+        let frameLength = Int(buffer.frameLength)
+        let ptr = floatChannelData[0]
+        let newSamples = Array(UnsafeBufferPointer(start: ptr, count: frameLength))
+        
+        accumulatedSamples.append(contentsOf: newSamples)
+        
+        // For Writer mode: cap at 5 minutes
+        let level = RefinementLevel(rawValue: LLMService.shared.intensity) ?? .editor
+        if level == .writer && accumulatedSamples.count > writerMaxSampleCount {
+            accumulatedSamples = Array(accumulatedSamples.suffix(writerMaxSampleCount))
+        }
+        
+        // Live preview: update transcript with current buffer
+        // (only for Raw/Editor — Writer shows the full transcript at the end)
+        if level != .writer && accumulatedSamples.count > 16000 && isRecording {
+            fluidAudio.transcribeLive(samples: accumulatedSamples)
         }
     }
 }

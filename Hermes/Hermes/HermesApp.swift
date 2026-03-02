@@ -70,20 +70,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
         
-        // 8. Bind Recording and Refining State to Window Visibility
-        Publishers.CombineLatest(AudioService.shared.$isRecordingState, LLMService.shared.$isRefining)
+        // 8. Bind Recording, Refining, and Processing State to Window Visibility
+        Publishers.CombineLatest3(AudioService.shared.$isRecordingState, LLMService.shared.$isRefining, AudioService.shared.$isProcessingPipeline)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] isRecording, isRefining in
+            .sink { [weak self] isRecording, isRefining, isProcessing in
                 guard FluidAudio.shared.isModelReady else { return }
+                
+                let isBusy = isRefining || isProcessing
+                
                 // Update Menu Bar Icon
                 if let button = self?.statusItem?.button {
-                    button.image = NSImage(systemSymbolName: isRecording ? "record.circle.fill" : (isRefining ? "brain" : "waveform.circle"), accessibilityDescription: "Hermes")
+                    button.image = NSImage(systemSymbolName: isRecording ? "record.circle.fill" : (isBusy ? "brain" : "waveform.circle"), accessibilityDescription: "Hermes")
                 }
                 
-                // Show/Hide Overlay
-                if isRecording || isRefining {
+                // Show overlay when recording starts or processing is active
+                if isRecording || isBusy {
                     WindowManager.shared.show()
-                } else {
+                }
+                
+                // Hide overlay + return focus only when fully done
+                if !isRecording && !isBusy {
                     WindowManager.shared.hide()
                     NSApplication.shared.hide(nil)
                 }

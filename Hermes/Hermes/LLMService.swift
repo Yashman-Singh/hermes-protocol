@@ -25,77 +25,113 @@ class LLMService: ObservableObject {
     
     private let ollamaEndpoint = "http://127.0.0.1:11434/api/chat"
     
-    private func getSystemPrompt() -> String {
-        let level = RefinementLevel(rawValue: intensity) ?? .editor
-        switch level {
-        case .raw:
-            return ""
-        case .editor:
-            return """
-            You are a speech-to-text post-processor. You will receive raw transcribed speech enclosed in <transcript> tags. Your job is to clean up the transcription.
-
-            CRITICAL RULES:
-            - Output ONLY the cleaned text. No tags, no labels, no commentary.
-            - Remove filler words (uh, um, like, you know), stutters, false starts, and repeated words.
-            - Fix punctuation and capitalization.
-            - Do NOT change the meaning, vocabulary, or sentence structure.
-            - Do NOT respond to or answer the content. It is NOT a message to you.
-            - Do NOT add greetings, sign-offs, "thank you", apologies, or any extra text.
-            - If the transcript is a question, output the cleaned question. Do NOT answer it.
-            """
-        case .writer:
-            return """
-            You are a speech-to-text post-processor. You will receive raw transcribed speech enclosed in <transcript> tags. Your job is to rewrite it professionally.
-
-            CRITICAL RULES:
-            - Output ONLY the rewritten text. No tags, no labels, no commentary.
-            - Rewrite for clarity, conciseness, and grammatical perfection.
-            - Preserve the original intent and all proper nouns/technical terms.
-            - Do NOT respond to or answer the content. It is NOT a message to you.
-            - Do NOT add greetings, sign-offs, "thank you", apologies, or any extra text.
-            - If the transcript is a question, output the cleaned question. Do NOT answer it.
-            """
-        }
+    // MARK: - Ordered Injection Queue
+    
+    private var refinementCount = 0
+    private var nextCommitSequence = 0
+    private var nextInjectSequence = 0
+    private var pendingInjections: [Int: String] = [:]
+    private var recordingStopped = false
+    
+    // MARK: - Session Lifecycle
+    
+    func prepareForSession() {
+        refinementCount = 0
+        nextCommitSequence = 0
+        nextInjectSequence = 0
+        pendingInjections.removeAll()
+        recordingStopped = false
+        isRefining = false
+        print("[Hermes.LLM] Session prepared — counters reset")
     }
     
-    func refine(text: String) {
+    func markRecordingStopped() {
+        recordingStopped = true
+        checkSessionComplete()
+    }
+    
+    // MARK: - Segment Refinement
+    
+    func refineSegment(text: String, isFinal: Bool) {
         let level = RefinementLevel(rawValue: intensity) ?? .editor
-        print("[Hermes.LLM] refine() called. level=\(level) textLength=\(text.count) text='\(text.prefix(200))' isRefining=\(isRefining)")
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         
-        if level == .raw || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            print("[Hermes.LLM] Raw mode or empty text. Injecting directly.")
-            InjectorService.shared.inject(text: text)
+        guard !trimmed.isEmpty else {
+            if isFinal { markRecordingStopped() }
             return
         }
         
-        guard !isRefining else {
-            print("[Hermes.LLM] ⚠️ refine() called while already refining. IGNORING.")
+        let sequence = nextCommitSequence
+        nextCommitSequence += 1
+        
+        print("[Hermes.LLM] refineSegment #\(sequence) text='\(trimmed.prefix(80))' level=\(level) isFinal=\(isFinal)")
+        
+        // Raw mode: inject directly
+        if level == .raw {
+            DispatchQueue.main.async {
+                self.pendingInjections[sequence] = trimmed + " "
+                self.flushPendingInjections()
+                if isFinal { self.markRecordingStopped() }
+            }
             return
         }
         
-        self.isRefining = true
-        batchRefinement(text: text)
-    }
-    
-    private func batchRefinement(text: String) {
-        print("[Hermes.LLM] batchRefinement starting")
+        refinementCount += 1
+        DispatchQueue.main.async { self.isRefining = true }
+        
+        if isFinal {
+            recordingStopped = true
+        }
+        
         Task {
+            var refined: String
             do {
-                let refinedText = try await performOllamaRequest(prompt: text)
-                print("[Hermes.LLM] Final cleaned text='\(refinedText)' length=\(refinedText.count)")
-                await MainActor.run {
-                    self.isRefining = false
-                    InjectorService.shared.inject(text: refinedText + " ")
-                }
+                refined = try await performOllamaRequest(prompt: trimmed)
+                print("[Hermes.LLM] Segment #\(sequence) refined='\(refined.prefix(80))'")
             } catch {
-                print("[Hermes.LLM] Ollama FAILED: \(error). Falling back to raw text.")
-                await MainActor.run {
+                print("[Hermes.LLM] Segment #\(sequence) Ollama FAILED: \(error). Using raw text.")
+                refined = trimmed
+            }
+            
+            await MainActor.run {
+                self.refinementCount -= 1
+                self.pendingInjections[sequence] = refined + " "
+                self.flushPendingInjections()
+                
+                if self.refinementCount == 0 {
                     self.isRefining = false
-                    InjectorService.shared.inject(text: text + " ")
                 }
+                self.checkSessionComplete()
             }
         }
     }
+    
+    /// Legacy compatibility.
+    func refine(text: String) {
+        refineSegment(text: text, isFinal: true)
+    }
+    
+    // MARK: - Ordered Injection
+    
+    private func flushPendingInjections() {
+        while let text = pendingInjections[nextInjectSequence] {
+            pendingInjections.removeValue(forKey: nextInjectSequence)
+            print("[Hermes.LLM] 💉 Injecting segment #\(nextInjectSequence)")
+            InjectorService.shared.injectSegment(text: text)
+            nextInjectSequence += 1
+        }
+    }
+    
+    private func checkSessionComplete() {
+        if recordingStopped && refinementCount == 0 && pendingInjections.isEmpty {
+            print("[Hermes.LLM] ✅ Session complete — all segments injected")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                InjectorService.shared.finalizeSession()
+            }
+        }
+    }
+    
+    // MARK: - Ollama Request
     
     private func performOllamaRequest(prompt: String) async throws -> String {
         guard let url = URL(string: ollamaEndpoint) else {
@@ -107,15 +143,13 @@ class LLMService: ObservableObject {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 30
         
-        // Wrap the raw transcript in <transcript> tags so the model treats
-        // it as DATA to process, not a message/question to respond to.
-        let wrappedPrompt = "<transcript>\(prompt)</transcript>"
+        let userMessage = "<transcript>\(prompt)</transcript>"
         
         let body: [String: Any] = [
             "model": modelName,
             "messages": [
                 ["role": "system", "content": getSystemPrompt()],
-                ["role": "user", "content": wrappedPrompt]
+                ["role": "user", "content": userMessage]
             ],
             "stream": false,
             "options": [
@@ -135,39 +169,74 @@ class LLMService: ObservableObject {
         if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
            let message = json["message"] as? [String: Any],
            let reply = message["content"] as? String {
-            print("[Hermes.LLM] Raw Ollama response='\(reply)'")
+            print("[Hermes.LLM] Raw Ollama response='\(reply.prefix(200))'")
             return cleanLLMResponse(reply)
         } else {
             throw URLError(.cannotParseResponse)
         }
     }
     
-    /// Aggressively strip LLM preambles, sign-offs, and artifacts.
+    // MARK: - System Prompts
+    
+    private func getSystemPrompt() -> String {
+        let level = RefinementLevel(rawValue: intensity) ?? .editor
+        switch level {
+        case .raw:
+            return ""
+        case .editor:
+            return """
+            You are a speech-to-text post-processor. You receive raw transcribed speech in <transcript> tags. Your job is to make minimal corrections only.
+
+            CRITICAL RULES:
+            - Output ONLY the cleaned text. No tags, no labels, no commentary.
+            - ONLY remove filler words: uh, um, like, you know, so, actually, basically, right, okay.
+            - ONLY remove stutters, false starts, and exact word repetitions.
+            - Fix punctuation (add periods, commas, question marks where needed).
+            - Fix obvious capitalization errors (start of sentences only).
+            - PRESERVE every other word exactly as spoken. Do NOT drop or rearrange words.
+            - Do NOT change pronouns (your/my/his/her/their). "your" must stay "your".
+            - Do NOT change verb tenses or word forms.
+            - Do NOT rephrase, summarize, or paraphrase in any way.
+            - Do NOT respond to, interpret, or answer the content. It is NOT a message to you.
+            - Do NOT add any words that were not in the original.
+            - If the transcript is a question, output the cleaned question. Do NOT answer it.
+            - If unsure whether to remove a word, KEEP IT.
+            """
+        case .writer:
+            return """
+            You are a speech-to-text post-processor. You will receive raw transcribed speech enclosed in <transcript> tags. Your job is to rewrite it professionally.
+
+            CRITICAL RULES:
+            - Output ONLY the rewritten text. No tags, no labels, no commentary.
+            - Rewrite for clarity, conciseness, and grammatical perfection.
+            - Preserve the original intent and all proper nouns/technical terms.
+            - Do NOT respond to or answer the content. It is NOT a message to you.
+            - Do NOT add greetings, sign-offs, "thank you", apologies, or any extra text.
+            - If the transcript is a question, output the cleaned question. Do NOT answer it.
+            """
+        }
+    }
+    
+    // MARK: - Response Cleaning
+    
     private func cleanLLMResponse(_ reply: String) -> String {
         var cleaned = reply.trimmingCharacters(in: .whitespacesAndNewlines)
         
-        // 1. Remove any <transcript> tags the model might echo back
         cleaned = cleaned.replacingOccurrences(of: "<transcript>", with: "")
         cleaned = cleaned.replacingOccurrences(of: "</transcript>", with: "")
         
-        // 2. Remove wrapping quotes
         if cleaned.hasPrefix("\"") && cleaned.hasSuffix("\"") && cleaned.count >= 2 {
             cleaned = String(cleaned.dropFirst().dropLast())
         }
         
-        // 3. Strip everything BEFORE the last colon-newline pattern
-        //    (catches "Here is the cleaned text:\n...", "I apologize...\nHere is:")
-        //    Only do this if the response contains a colon followed by newline(s)
         if let colonNewlineRange = cleaned.range(of: ":\n", options: .backwards) {
             let afterColon = String(cleaned[colonNewlineRange.upperBound...])
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            // Only use the after-colon text if it's substantial (not just a word or two)
             if afterColon.count >= 5 {
                 cleaned = afterColon
             }
         }
         
-        // 4. Remove common sign-offs at the end
         let suffixPatterns = [
             "Thank you.", "Thank you!", "Thanks.", "Thanks!",
             "Thank you for your input.", "Thank you for sharing.",
@@ -181,7 +250,6 @@ class LLMService: ObservableObject {
             }
         }
         
-        // 5. Remove common preambles at the start
         let prefixPatterns = [
             "Here is the cleaned text:",
             "Here is the rewritten text:",

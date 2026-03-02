@@ -38,6 +38,41 @@ class InjectorService {
     private let immediateClipboardFocusErrorCodes: Set<Int32> = [-25212]
     private let debugLoggingEnabled = true
     
+    /// Clipboard snapshot saved at session start — restored when all segments are done.
+    private var savedClipboard: [[NSPasteboard.PasteboardType: Data]]?
+    
+    // MARK: - Streaming Segment Injection
+    
+    /// Snapshot the clipboard at the start of a recording session.
+    func beginSession() {
+        savedClipboard = snapshotPasteboardItems(NSPasteboard.general)
+        debugLog("Session started — clipboard saved")
+    }
+    
+    /// Lightweight inject for streaming segments during recording.
+    /// Target app already has focus — just clipboard + Cmd+V.
+    /// No app hide, no delays, no clipboard restore.
+    func injectSegment(text: String) {
+        guard !text.isEmpty else { return }
+        debugLog("Segment inject: '\(text.prefix(60))' length=\(text.count)")
+        
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        simulatePaste()
+    }
+    
+    /// Called after all segments are injected. Restores the original clipboard.
+    func finalizeSession() {
+        debugLog("Session finalized — restoring clipboard")
+        if let saved = savedClipboard {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                self?.restorePasteboardItems(saved, to: NSPasteboard.general)
+                self?.savedClipboard = nil
+            }
+        }
+    }
+    
     @discardableResult
     func hasAccessibilityPermission(promptIfNeeded: Bool = false) -> Bool {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: promptIfNeeded] as CFDictionary
@@ -54,9 +89,11 @@ class InjectorService {
         guard !text.isEmpty else { return }
         debugLog("Inject requested. textLength=\(text.count)")
         
+        // If we don't have accessibility permission, fall back to clipboard
+        // without re-prompting. The prompt is shown once on launch.
         guard hasAccessibilityPermission(promptIfNeeded: false) else {
-            requestAccessibilityPermissionIfNeeded()
-            copyToClipboardForManualPaste(text: text)
+            debugLog("No accessibility permission — falling back to clipboard")
+            injectViaClipboard(text: text)
             return
         }
         

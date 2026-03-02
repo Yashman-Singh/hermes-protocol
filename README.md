@@ -63,9 +63,10 @@ On first launch, the app will request:
 
 ## Architecture 🏗️
 
-*   **The Ear (Audio)**: `AVAudioEngine` captures 16kHz Float32 audio.
-*   **The Brain (ASR)**: `FluidAudio` runs the `Parakeet TDT` model for real-time transcription.
-*   **The Refiner (LLM)**: `Ollama` cleans up speech artifacts via `/api/chat`.
+*   **The Ear (Audio)**: `AVAudioEngine` captures 16kHz Float32 audio, frozen into 8-second chunks.
+*   **The Brain (ASR)**: `FluidAudio` runs the `Parakeet TDT` model for one-shot chunk transcription.
+*   **The Pipeline**: Sentence-boundary-aware carry-forward ensures only complete sentences are processed. Incomplete tails are carried to the next chunk.
+*   **The Refiner (LLM)**: `Ollama` cleans up speech artifacts via `/api/chat` (Editor mode) or rewrites professionally (Writer mode).
 *   **The Hand (Injector)**: Accessibility APIs (`AXUIElement`) inject text, with `NSPasteboard` fallback for web/Electron apps.
 
 ## License 📄

@@ -18,7 +18,7 @@ struct SettingsPopoverView: View {
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundColor(.primary)
                 Spacer()
-                Text("v1.1")
+                Text("v1.2")
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .foregroundColor(.secondary.opacity(0.5))
             }

@@ -44,11 +44,6 @@ It captures your speech, transcribes it locally using the `FluidAudio` engine (p
     ```
 3.  Build and Run (`Cmd + R`).
 
-### Distributing to Friends
-1.  In Xcode: **Product → Archive**.
-2.  In the Organizer: **Distribute App → Copy App**.
-3.  Compress the `.app` and share. Recipients need [Ollama](https://ollama.com) running with a model pulled.
-
 ## Permissions 🔐
 
 On first launch, the app will request:

@@ -6,7 +6,6 @@ import Combine
 class FluidAudio: ObservableObject {
     static let shared = FluidAudio()
     
-    @Published var transcript: String = ""
     @Published var status: String = "Initializing..."
     @Published var isModelReady: Bool = false
     
@@ -56,63 +55,6 @@ class FluidAudio: ObservableObject {
         } catch {
             print("[Hermes.ASR] Chunk transcription error: \(error)")
             return ""
-        }
-    }
-    
-    // MARK: - Live Preview (optional, runs during recording)
-    
-    private var isTranscribing = false
-    private var pendingSamples: [Float]?
-    private var isStopped = true
-    
-    func prepareForNewSession() {
-        isStopped = false
-        isTranscribing = false
-        pendingSamples = nil
-    }
-    
-    func startSession() async {
-        await MainActor.run {
-            self.transcript = ""
-        }
-    }
-    
-    func stopSession() {
-        isStopped = true
-        pendingSamples = nil
-    }
-    
-    /// Live transcription of the current audio buffer for overlay preview.
-    /// This updates `self.transcript` but is NOT used for injection.
-    func transcribeLive(samples: [Float]) {
-        guard isModelReady, !isStopped, let asrManager = asrManager else { return }
-        
-        if isTranscribing {
-            pendingSamples = samples
-            return
-        }
-        
-        isTranscribing = true
-        
-        Task {
-            do {
-                let result = try await asrManager.transcribe(samples, source: .system)
-                if !self.isStopped {
-                    await MainActor.run {
-                        if !result.text.isEmpty {
-                            self.transcript = result.text
-                        }
-                    }
-                }
-            } catch {
-                // Silently ignore live preview errors
-            }
-            
-            self.isTranscribing = false
-            if !self.isStopped, let pending = self.pendingSamples {
-                self.pendingSamples = nil
-                self.transcribeLive(samples: pending)
-            }
         }
     }
 }

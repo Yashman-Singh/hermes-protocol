@@ -155,11 +155,6 @@ class AudioService: ObservableObject {
         // Prepare services
         LLMService.shared.prepareForSession()
         InjectorService.shared.beginSession()
-        fluidAudio.prepareForNewSession()
-        
-        Task {
-            await fluidAudio.startSession()
-        }
         
         // Start chunk timer for Raw/Editor modes (not Writer)
         let level = RefinementLevel(rawValue: LLMService.shared.intensity) ?? .editor
@@ -182,7 +177,6 @@ class AudioService: ObservableObject {
         engine.stop()
         
         stopChunkTimer()
-        fluidAudio.stopSession()
         
         let level = RefinementLevel(rawValue: LLMService.shared.intensity) ?? .editor
         
@@ -334,6 +328,7 @@ class AudioService: ObservableObject {
                 if !self.chunkQueue.isEmpty {
                     self.processNextChunk(isFinal: isFinal)
                 } else {
+                    self.isProcessingPipeline = false
                     self.flushCarryIfDone()
                 }
             }
@@ -417,12 +412,6 @@ class AudioService: ObservableObject {
         let level = RefinementLevel(rawValue: LLMService.shared.intensity) ?? .editor
         if level == .writer && accumulatedSamples.count > writerMaxSampleCount {
             accumulatedSamples = Array(accumulatedSamples.suffix(writerMaxSampleCount))
-        }
-        
-        // Live preview: update transcript with current buffer
-        // (only for Raw/Editor — Writer shows the full transcript at the end)
-        if level != .writer && accumulatedSamples.count > 16000 && isRecording {
-            fluidAudio.transcribeLive(samples: accumulatedSamples)
         }
     }
 }

@@ -377,14 +377,7 @@ class InjectorService {
         }
     }
     
-    private func copyToClipboardForManualPaste(text: String) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
-        print("Accessibility permission not granted. Copied text to clipboard for manual paste.")
-    }
     
-
-
     
     private func snapshotPasteboardItems(_ pasteboard: NSPasteboard) -> [[NSPasteboard.PasteboardType: Data]] {
         guard let items = pasteboard.pasteboardItems else { return [] }

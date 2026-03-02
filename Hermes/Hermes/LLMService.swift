@@ -105,11 +105,7 @@ class LLMService: ObservableObject {
             }
         }
     }
-    
-    /// Legacy compatibility.
-    func refine(text: String) {
-        refineSegment(text: text, isFinal: true)
-    }
+
     
     // MARK: - Ordered Injection
     
